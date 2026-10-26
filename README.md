@@ -1,6 +1,6 @@
 # MTP 投机解码在昇腾 910B 上的 K×并发消融与性能归因
 
-> **TL;DR (EN)** — Speculative decoding (MTP) on Ascend NPU was believed to be a net loss. We showed that conclusion was a **measurement artifact**: the streaming benchmark client over-counts ~19 ms/iteration *only* for speculative decoding, and early EOS moves the denominator. With a corrected dual-caliber measurement, MTP is **−43% TPOT** at single stream (K=3, 12.0 vs 17.2 ms/token). We then mapped the full operating envelope: the optimal draft depth **falls with concurrency (K\* = 3/3/2/1 at conc 1/4/16/64 → +40%/+29%/+16%/+10%)**, and gains **flip sign** at K=5/conc=16 (0.86×) and K=3/conc=64 (0.85×) — while acceptance length stays flat (2.38–2.41), proving the flip is pure verify-compute pressure, not quality loss. Attribution (operator-level traces) gives the +4.25 ms/iteration host-side marginal (sync 2.9 / launch 1.1 / copy 0.4) and a 58% vs 92% device-utilization gap. Two optimization tracks were closed **by measurement rather than by hope**: out-of-graph op pooling is neutral (this platform is dispatch-bound, not alloc-bound), and a 6.1 ms/iter sync is real but off the critical path.
+> **TL;DR (EN)** — Speculative decoding (MTP) on Ascend NPU was believed to be a net loss. We showed that conclusion was a **measurement artifact**: the streaming benchmark client over-counts ~19 ms/iteration *only* for speculative decoding, and early EOS moves the denominator. With a corrected dual-caliber measurement, MTP is **−43% TPOT** at single stream (K=3, 12.0 vs 17.2 ms/token). We then mapped the full operating envelope: the optimal draft depth **falls with concurrency (K\* = 3/3/2/1 at conc 1/4/16/64 → +40%/+29%/+16%/+10%)**, and gains **flip sign** at K=5/conc=16 (0.86×) and K=3/conc=64 (0.85×) — while acceptance length stays flat (2.38–2.41), proving the flip is pure verify-compute pressure, not quality loss. Attribution (operator-level traces) gives the +4.25 ms/iteration host-side marginal (sync 2.9 / launch 1.1 / copy 0.4) and a 58% vs 92% device-utilization gap. Delivered per-track numbers: making the upstream dynamic-speculative path usable cost **−58% → 0% (12.0 vs 28.2 ms/token, +135%)**; out-of-graph op pooling is **neutral** (−0.5 ms/token, inside the ±0.7 ms noise band) because this platform is **dispatch-bound, not alloc-bound**; and a **6.1 ms/iter** host sync was proven **off the critical path** by an A/B knob — a negative result that cancelled a whole rewrite.
 
 **中文一句话**：把"MTP 在昇腾上恒负收益"这个结论推翻（测量口径错误），改成实测 **+43% 单流加速**，并测绘出 **K×并发包络与收益翻转点**；再对宿主开销做逐算子归因，把两条优化腿用测量结案，最后把第三条腿（按 K 补图/动态 K）推到平台边界并给出可复现的判定实验。
 
@@ -106,16 +106,19 @@ c(K) = 每请求计算成本                        ← 高并发时主导
 
 ### 7.1 图外小算子池化 → 实测中性（结案）
 做法：pinned buffer 双块交替、CPU arange 预建、block-table clone 复用 buffer。
-结果：k1 每迭代 26.1 → 25.1 ms（−1.0 ms），在双口径基准下 **性能中性**（15.7–15.9 vs 基线 15.8）。
+结果（口径务必分清）：每轮投机（propose + verify）耗时 **26.1 → 25.1 ms**（同口径基线 K=0 = 15.7 ms/轮）；折算到 per-token 是 −1.0 / 2.03 ≈ **−0.5 ms/token**，落在实测噪声带（±0.7 ms）内，因此双口径下判为 **性能中性**（15.7–15.9 vs 基线 15.8 ms/token）。
 **根因判据**：该平台按 **派发次数** 定价（aclnn ≈ 12.7 µs/次，CUDA ≈ 3 µs），而 caching allocator 让分配近乎免费 ⇒ 这是 **dispatch-bound 而非 alloc-bound**，池化省的是本来就不缺的东西。它的净价值转为"恒地址性"= 图化的使能条件（也正是上游给 GLM 做池化的动机）。
 
 ### 7.2 消除同步 → 真实但不在关键路径（结案）
 用 per-site 计时模块定位到 `num_accepted_tokens_event.synchronize()` 每次 **6.1 ms**（此前从 api_statistic 估的 2.9 ms 口径作废——torch_npu 的 Event.synchronize 内部轮询没被计入）。
-加 A/B 开关跳过该同步后：**输出正确、性能零变化** ⇒ 该等待是浪费但不在关键路径上。剩余 ~3 ms/迭代 的同步在 vLLM core 侧（本 fork 边界之外）。
+加 A/B 开关跳过该同步后实测：**输出正确、acceptance 1.80 不塌，但性能零变化**（K=1 per-token 15.7–16.1 vs 基线 15.8；K=3 11.6–11.8 vs 12.0）⇒ 6.1 ms 是真实的宿主白等，却被设备忙等遮蔽、不在关键路径上。剩余 ~3 ms/迭代 的同步位于 vLLM core 侧（本 fork 边界之外）。**这条腿的收益是"方向性"的：省掉一整轮以它为目标的重写，并留下一个可上游的安全开关。**
 **这条腿以"没有补丁可写"为合法结论收线**，而不是硬改一处代码去交差。
 
 ### 7.3 按 K 补图 / 动态 K → 推到平台边界（roadmap）
-目标：让运行时 K 拥有自己的 ACL 图，从而"一个配置吃满包络"（K 随并发自适应）。上游已有一条通道（`num_speculative_tokens_per_batch_size`）会下发每步 K，但 **vllm-ascend 的 MTP 路径绕过了 K 重绑点**，且一旦配置该表就把 `cudagraph_mode` 从 FULL 降级（实测代价：28.2 vs 12.0 ms/token）。
+目标：让运行时 K 拥有自己的 ACL 图，从而"一个配置吃满包络"（K 随并发自适应）。上游已有一条通道（`num_speculative_tokens_per_batch_size`）会下发每步 K，但 **vllm-ascend 的 MTP 路径绕过了 K 重绑点**，且一旦配置该表就把 `cudagraph_mode` 从 FULL 降级。
+
+**这条腿已兑现的收益**：启用上游动态投机通道的代价，从 **28.2 ms/token（降级后，比静态 K=3 差 2.35×）**降到 **0（12.0 ms/token = 静态最优）** ⇒ 该路径上 **+135%**；并让"切换机制"端到端可用（`dynamic K: 3 -> 1` 日志 + 按 K 预捕 `0 sizes failed` + 桶格无 padding）。
+**仍未兑现**：运行时 K≠配置 K 的**图回放**本身（见下表第 7 层）——所以包络里"切换档"的那部分收益（如 K=2@conc16 = +16%）目前是路线图而非既得数字。
 
 实现链路（代码见 fork `f2p-mtp-first-pass` 分支）：调度表 → 调度器下发 → drafter K 重绑 → **draft 图按 (bucket, K) 双键** → 启动期穷尽预捕 → 桶格按 `lcm(所有 span)` 重排 → 覆盖守卫（无图可用时保持配置 K）。
 
