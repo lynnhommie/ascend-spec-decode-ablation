@@ -18,7 +18,7 @@
 
 **中文**：投机解码（MTP）在国产 NPU 上的收益曾被内部基准判定为"恒为负收益"。本文首先证明**该结论源于客户端测量伪影**：流式基准在投机解码下对实验臂单侧多计约 19 ms/迭代，同时 EOS 早停使分母逐轮漂移。以双口径方法重建测量后，结论反转为**单流 TPOT −43%**（12.0 vs 17.2 ms/token，K=3）。在此基础上，本文测得投机解码的**收益包络**：最优草稿深度随并发单调下降（K\* = 3/3/2/1，对应 +40%/+29%/+16%/+10%），并在 K=5@conc=16（0.86×）与 K=3@conc=64（0.85×）处观测到**收益符号翻转**；同期接受长度保持稳定（2.38–2.41），证明翻转源于验证算力约束而非接受质量下降。第三，本文将开销**归因到算子级**：相对无投机基线的宿主边际为 +4.25 ms/迭代（同步 2.9 / 内核派发 1.1 / 数据搬运 0.4），且新增 117 个小算子仅带来 0.64 ms 设备时长——表明该平台瓶颈位于**内核派发而非内存分配**。最后，本文把"为运行时草稿深度补图"（动态投机 + 按 K 的图捕获）推进至平台边界：实现全链路并逐层根因修复 6 类缺陷，使**启用上游动态投机通道的代价由 −58% 降至 0%（+135%）**；并以同形对照实验证明，剩余失效来自平台"多形状计算图交替回放"这一路径本身，与上游在配置可变 K 时禁用 FULL 图的设计决策互相印证。
 
-**English**: Speculative decoding with multi-token prediction (MTP) on Ascend NPUs had been judged internally as a consistent net loss. We first show that this verdict is a **client-side measurement artifact**: a streaming benchmark charges the speculative arm ~19 ms/iteration that the baseline does not pay, and early EOS drifts the denominator. With a dual-caliber measurement (non-streaming wall-clock + server-side acceptance-counter differencing), the result reverses to **−43% TPOT** at single stream. We then map the **operating envelope**: the optimal draft depth falls monotonically with concurrency (K\* = 3/3/2/1 → +40/+29/+16/+10%), and the sign of the gain **flips** at K=5/conc=16 (0.86×) and K=3/conc=64 (0.85×) while acceptance length stays flat (2.38–2.41) — the flip is verify-compute pressure, not quality loss. Operator-level traces attribute a **+4.25 ms/iteration** host marginal (sync 2.9 / launch 1.1 / copy 0.4) and show that 117 additional kernels cost only 0.64 ms of device time, i.e. the platform is **dispatch-bound rather than alloc-bound**. Finally we take per-K graph capture to the platform boundary: implementing the full chain reduces the cost of enabling upstream dynamic speculation from **−58% to 0% (+135%)**, and a same-shape control experiment proves the residual failure lies in the platform's replay of alternating graph sets — consistent with upstream's decision to disable FULL graphs under variable K.
+**English**: The first round of this project (m0, 2026-10-22) had concluded that MTP speculative decoding on Ascend NPU is a net loss *at every K and every load*. That verdict mixed two different things: the single-stream half is a **client-side measurement artifact** (a streaming benchmark charges the speculative arm ~19 ms/iteration that the baseline does not pay, and early EOS drifts the denominator), while the high-concurrency half is **real**. With a dual-caliber measurement (non-streaming wall-clock + server-side acceptance-counter differencing), the single-stream result reverses to **−43% TPOT**. We then map the **operating envelope**: the optimal draft depth falls monotonically with concurrency (K\* = 3/3/2/1 → +40/+29/+16/+10%), and the sign of the gain **flips** at K=5/conc=16 (0.86×) and K=3/conc=64 (0.85×) while acceptance length stays flat (2.38–2.41) — the flip is verify-compute pressure, not quality loss. Operator-level traces attribute a **+4.25 ms/iteration** host marginal (sync 2.9 / launch 1.1 / copy 0.4) and show that 117 additional kernels cost only 0.64 ms of device time, i.e. the platform is **dispatch-bound rather than alloc-bound**. Finally we take per-K graph capture to the platform boundary: implementing the full chain reduces the cost of enabling upstream dynamic speculation from **−58% to 0% (+135%)**, and a same-shape control experiment proves the residual failure lies in the platform's replay of alternating graph sets — consistent with upstream's decision to disable FULL graphs under variable K.
 
 ## 目录
 
@@ -39,7 +39,7 @@
 
 **为什么是 Qwen3.5 + MTP。** Qwen3.5 系列在主干之外自带一个 MTP（multi-token prediction）草稿层，因此**不需要额外训练独立 draft 模型**即可获得投机解码能力。对国产算力部署而言，这是投入产出比最高的延迟优化入口——但也意味着草稿头的形状、KV 复用与验证流程完全由推理框架决定，优化空间只存在于引擎内部。
 
-**为什么需要重新测量。** vllm-ascend 作为硬件插件天然滞后于 vLLM 主干（本次栈对应主干 0.26，主干当时已至 0.32+），**主干上成立的最优配置在 NPU 上未必成立**。当时流传的"MTP 在昇腾恒负收益"结论来自一次流式基准，未经口径审查。
+**为什么需要重新测量。** vllm-ascend 作为硬件插件天然滞后于 vLLM 主干（本次栈对应主干 0.26，主干当时已至 0.32+），**主干上成立的最优配置在 NPU 上未必成立**。"MTP 在昇腾恒负收益"这个说法**不是外部共识，而是本项目首轮（m0，2026-10-22）自己的实测结论**（报告原文："性能为负：所有 K、所有负载"），且未经口径审查。
 
 **NPU 环境的三个约束条件决定了本项目的技术路线：**
 
@@ -74,13 +74,15 @@
 
 ### 3.1 问题：错误口径如何产生错误结论
 
-初始结论"MTP 恒负收益（TPOT 17.5 vs 15.7 ms）"来自 vLLM 自带的流式压测客户端。逐项排查后确认存在三个**互相掩盖**的缺陷：
+初始结论"MTP 恒负收益（TPOT 17.5 vs 15.7 ms）"来自**本项目 m0 首轮**用 vLLM 自带流式压测客户端做的测量。逐项排查后确认存在三个**互相掩盖**的缺陷：
 
 | 缺陷 | 机理 | 影响方向 |
 |---|---|---|
 | 流式分块成本 | 投机解码每个 SSE 分块通常仅携带 1–2 个 token，客户端分块解析/回调成本被计入逐 token 时延；K=0 每轮稳定输出 1 个 token，几乎不受影响 | **仅惩罚实验臂** ~19 ms/迭代 |
 | EOS 早停 | 同一 prompt 实际输出 140 token（上限 256）；若以 `max_tokens` 为分母则每轮分母漂移 | 系统性偏差 + 轮间抖动 |
 | 计数器窗口语义 | vLLM 的 SpecDecoding 指标按 **10 秒窗口清零**（非累计） | 跨窗口差分产生荒谬值（曾测得 acceptance = 25.6） |
+
+**伪影的连带杀伤范围**：m0 报告里"单个 draft 步 ≈21.3 ms，比整个 9B 模型一次 decode（15.7 ms）还贵"这条"数学铁证"，是用被抬高的 TPOT 反推出来的（25.7 × 3.61 ≈ 92.5 ms/轮）；换口径后每轮实际约 28.5 ms ⇒ **该推导随口径修正一并作废**。（GDN 小序列被路由进 chunked 内核确有其事，但撑不起那个量级。）
 
 ### 3.2 采用的双口径定义
 
